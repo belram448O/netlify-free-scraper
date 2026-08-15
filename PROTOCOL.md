@@ -6,7 +6,8 @@
 2. **Build plugin (queue) is for long-running jobs only.** Small/fast jobs go through the function synchronously.
 3. **Batch requests are atomic.** A single function call processes N URLs and returns all results in one response (or all in blobs).
 4. **Same job spec everywhere.** Function and build plugin accept identical job format — only the runner differs.
-5. **Three engines, picked per-job:** `fetch` (fast, Node fingerprint), `chrome_impersonate` (Chrome JA3 via tls-impersonate), `puppeteer` (real Chrome, build-only).
+5. **Three engines, picked per-job:** `fetch` (fast, Node fingerprint), `chrome_impersonate` (configurable TLS via tls-impersonate), `puppeteer` (real Chrome, build-only).
+6. **Configurable TLS fingerprint:** When using `chrome_impersonate`, pass `tls_profile` to select a preset (`chrome120`, `firefox`, `safari`) or pass a custom ClientHello spec object for full control.
 
 ## Job spec (canonical)
 
@@ -38,6 +39,7 @@ A single job describes one URL fetch:
 | `headers` | object | `{}` | Custom request headers |
 | `body` | string\|null | null | Request body (for POST/PUT) |
 | `engine` | string | `fetch` | `fetch` \| `chrome_impersonate` \| `puppeteer` (puppeteer is queue-only) |
+| `tls_profile` | string\|object | `chrome120` | Preset: `chrome120`, `firefox`, `safari`. Or pass a custom ClientHello spec: `{ cipherSuites: [...], extensions: [...], supportedGroups: [...], signatureAlgorithms: [...], alpnProtocols: [...] }`. Only used with `chrome_impersonate` engine. |
 | `timeout_ms` | number | 25000 (function) / 60000 (build) | Per-job timeout. Capped at 25000 in function mode (under 28s Lambda hard limit) |
 | `follow_redirects` | boolean | true | Follow HTTP redirects (only `fetch` engine; `chrome_impersonate` and `puppeteer` don't follow) |
 | `user_agent` | string | Chrome 120 UA | User-Agent header |
@@ -210,7 +212,76 @@ index/latest                       — JSON: pointer to most recent batch
 | JS-rendered page (needs real Chrome) | Queue → build plugin + `engine=puppeteer` |
 | Login flow, click sequences | Queue → build plugin + `engine=puppeteer` + `actions=[...]` |
 
-## CLI tools (no function calls wasted for queue management)
+## Function API endpoints (no CLI or PAT needed)
+
+The function exposes multiple routes so the full scrape → poll → retrieve flow works via HTTP alone:
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/scrape` | Submit batch scrape (sync or queue mode) |
+| GET | `/api/status/{batchId}` | Check batch status |
+| GET | `/api/result/{batchId}/{index}` | Retrieve a result blob (raw bytes passthrough) |
+| GET | `/api/list[?status=...&limit=20]` | List recent batches |
+| POST | `/api/trigger-build` | Trigger a preview deploy (process queue — requires `NETLIFY_AUTH_TOKEN` + `SITE_ID` env vars) |
+| POST | `/api/resume` | Resume incomplete batches (crash recovery) |
+
+### Full e2e flow via HTTP only (no CLI, no PAT)
+
+```bash
+# 1. Submit a batch to the queue
+curl -X POST 'https://<deploy-url>/api/scrape' \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <SCRAPE_API_KEY>' \
+  -d '{"jobs":[{"url":"https://example.com","engine":"chrome_impersonate","tls_profile":"firefox"}],"queue":true}'
+# → { "batch_id": "batch-xxx", "status": "pending" }
+
+# 2. Trigger a build to process the queue
+curl -X POST 'https://<deploy-url>/api/trigger-build' \
+  -H 'Authorization: Bearer <SCRAPE_API_KEY>'
+# → { "ok": true, "deploy_id": "..." }
+
+# 3. Poll status
+curl 'https://<deploy-url>/api/status/batch-xxx' \
+  -H 'Authorization: Bearer <SCRAPE_API_KEY>'
+# → { "batch_id": "batch-xxx", "status": "complete", "results": [...] }
+
+# 4. Retrieve the result
+curl 'https://<deploy-url>/api/result/batch-xxx/0' \
+  -H 'Authorization: Bearer <SCRAPE_API_KEY>'
+# → raw bytes of scraped content
+```
+
+### TLS profile usage
+
+When using `chrome_impersonate` engine, you can customize the TLS fingerprint:
+
+```json
+// Preset profiles
+{"url":"https://example.com","engine":"chrome_impersonate","tls_profile":"chrome120"}
+{"url":"https://example.com","engine":"chrome_impersonate","tls_profile":"firefox"}
+{"url":"https://example.com","engine":"chrome_impersonate","tls_profile":"safari"}
+
+// Custom ClientHello spec (full control)
+{
+  "url": "https://example.com",
+  "engine": "chrome_impersonate",
+  "tls_profile": {
+    "cipherSuites": [0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f],
+    "extensions": [
+      {"type": 0x0016}, {"type": 0x000b}, {"type": 0xff01}, {"type": 0x0000},
+      {"type": 0x0010, "alpnProtocols": ["h2", "http/1.1"]},
+      {"type": 0x002b}, {"type": 0x0033}
+    ],
+    "supportedGroups": [0x001d, 0x0017],
+    "signatureAlgorithms": [0x0403, 0x0804, 0x0401],
+    "alpnProtocols": ["h2", "http/1.1"]
+  }
+}
+```
+
+Available presets: `chrome120`, `firefox`, `safari`. Default: `chrome120`.
+
+## CLI tools (alternative to function API)
 
 ```bash
 # Submit a batch (sync, function processes inline)
