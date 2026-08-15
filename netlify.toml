@@ -1,0 +1,12 @@
+[build]
+  command = "npm install"
+  publish = "src"
+  functions = "functions"
+
+[functions]
+  node_bundler = "zisi"
+  external_node_modules = ["tls-impersonate"]
+  included_files = ["functions/node_modules/**", "lib/**"]
+
+[[plugins]]
+  package = "./plugins/process-queue"

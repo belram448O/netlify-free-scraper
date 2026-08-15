@@ -1,0 +1,13 @@
+{
+  "name": "functions",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@netlify/blobs": "^8.0.0",
+    "tls-impersonate": "^0.1.0"
+  },
+  "allowScripts": {
+    "tls-impersonate": true
+  }
+}

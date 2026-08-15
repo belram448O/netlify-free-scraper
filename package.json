@@ -1,0 +1,34 @@
+{
+  "name": "netlify-free-scraper",
+  "version": "1.0.0",
+  "description": "Production batch HTTP scraper for Netlify free tier — TLS impersonation, queued processing, blob storage",
+  "type": "module",
+  "main": "lib/scraper.mjs",
+  "exports": {
+    ".": "./lib/scraper.mjs",
+    "./function": "./functions/scrape.mjs",
+    "./plugin": "./plugins/process-queue/index.js",
+    "./cli/submit": "./cli/submit.mjs",
+    "./cli/status": "./cli/status.mjs",
+    "./cli/result": "./cli/result.mjs",
+    "./cli/list": "./cli/list.mjs",
+    "./tools/dashboard-api": "./tools/netlify-dashboard-api.mjs"
+  },
+  "scripts": {
+    "deploy:preview": "netlify deploy --message \"scraper deploy\"",
+    "deploy:prod": "echo 'WARNING: costs 15 credits' && netlify deploy --prod",
+    "logs": "netlify logs --json --since 1h"
+  },
+  "dependencies": {
+    "@netlify/blobs": "^8.0.0",
+    "tls-impersonate": "^0.1.0",
+    "@sparticuz/chromium": "^127.0.0",
+    "puppeteer-core": "^23.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/belram448O/netlify-free-scraper.git"
+  },
+  "license": "MIT",
+  "keywords": ["netlify", "scraper", "free-tier", "tls-impersonation", "puppeteer", "serverless"]
+}
