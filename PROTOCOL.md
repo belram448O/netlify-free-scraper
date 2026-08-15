@@ -222,14 +222,47 @@ The function exposes multiple routes so the full scrape → poll → retrieve fl
 | GET | `/api/status/{batchId}` | Check batch status |
 | GET | `/api/result/{batchId}/{index}` | Retrieve result metadata + blob URL (NOT the bytes — saves bandwidth). Use `?passthrough=1` to get raw bytes (costs credits). |
 | GET | `/api/list[?status=...&limit=20]` | List recent batches |
-| POST | `/api/trigger-build` | Trigger a preview deploy WITH file content (forces build to run). Requires `NETLIFY_AUTH_TOKEN` + `SITE_ID` env vars. |
+| POST | `/api/trigger-build` | Create a deploy via API (writes trigger file). ⚠️ API deploys do NOT trigger the build process — use `netlify deploy` CLI or Git push for queue processing. Requires `NETLIFY_AUTH_TOKEN` + `SITE_ID` env vars. |
 | POST | `/api/resume` | Resume incomplete batches (crash recovery) |
 | GET | `/api/result/{batchId}/{index}?passthrough=1` | Retrieve raw blob bytes through the function (costs bandwidth — 20 cr/GB) |
 
-### Full e2e flow via HTTP only (no CLI, no PAT for client)
+### Queue processing limitation (important)
 
-**Note:** The function needs `NETLIFY_AUTH_TOKEN` + `SITE_ID` env vars set in the Netlify dashboard for `/api/trigger-build` to work. But the CLIENT calling the API only needs `SCRAPE_API_KEY` (which can be any shared secret — not a Netlify PAT).
+**API deploys (including `POST /api/trigger-build`) do NOT trigger the build process.** Netlify treats API-created deploys as direct CDN uploads — they complete in ~1 second with "N files uploaded" but do NOT run `npm install`, function bundling, or build plugins.
 
+Only these trigger the full build (which runs the `process-queue` plugin):
+1. **`netlify deploy` CLI** — runs build locally, uploads the output (recommended)
+2. **Git push** — if site is Git-connected, Netlify auto-builds from the webhook
+3. **GitHub Actions cron** — runs `netlify deploy` on a schedule
+
+```yaml
+# .github/workflows/process-queue.yml
+name: Process queue
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    steps:
+      - run: npm install -g netlify-cli
+      - run: netlify deploy --message "process queue"
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+```
+
+### Full e2e flow
+
+**Sync scrape (immediate, no CLI, no PAT needed):**
+```bash
+curl -X POST 'https://<deploy-url>/api/scrape' \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <SCRAPE_API_KEY>' \
+  -d '{"jobs":[{"url":"https://example.com","engine":"fetch"}],"result_mode":"blob"}'
+# → {"batch_id":"batch-xxx","status":"complete","results":[...]}
+```
+
+**Queue scrape (requires CLI for processing):**
 ```bash
 # 1. Submit a batch to the queue
 curl -X POST 'https://<deploy-url>/api/scrape' \
@@ -238,10 +271,10 @@ curl -X POST 'https://<deploy-url>/api/scrape' \
   -d '{"jobs":[{"url":"https://example.com","engine":"chrome_impersonate","tls_profile":"firefox"}],"queue":true}'
 # → { "batch_id": "batch-xxx", "status": "pending" }
 
-# 2. Trigger a build to process the queue (function writes a trigger file to force build)
-curl -X POST 'https://<deploy-url>/api/trigger-build' \
-  -H 'Authorization: Bearer <SCRAPE_API_KEY>'
-# → { "ok": true, "deploy_id": "...", "pending_count": 1 }
+# 2. Process queue via CLI (API deploys don't trigger builds!)
+#    Run: netlify deploy --message "process queue"
+#    Or: git push (if Git-connected)
+#    Or: GitHub Actions cron (see above)
 
 # 3. Poll status (small JSON — no bandwidth cost)
 curl 'https://<deploy-url>/api/status/batch-xxx' \
