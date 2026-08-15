@@ -95,7 +95,7 @@ export default async function handler(req, context) {
     return handleStatus(batchId);
   }
 
-  // === GET /api/result/{batchId}/{index} — Retrieve result blob ===
+  // === GET /api/result/{batchId}/{index} — Retrieve result metadata (or raw bytes with ?passthrough=1) ===
   if (method === 'GET' && path.startsWith('/api/result/')) {
     const parts = path.replace('/api/result/', '').split('/');
     if (parts.length !== 2) {
@@ -106,7 +106,8 @@ export default async function handler(req, context) {
     if (!Number.isFinite(index) || index < 0) {
       return Response.json({ error: 'index must be a non-negative integer' }, { status: 400 });
     }
-    return handleResult(batchId, index);
+    const passthrough = url.searchParams.get('passthrough') === '1';
+    return handleResult(batchId, index, passthrough);
   }
 
   // === GET /api/list — List recent batches ===
@@ -269,7 +270,7 @@ async function handleStatus(batchId) {
   }
 }
 
-async function handleResult(batchId, index) {
+async function handleResult(batchId, index, passthrough = false) {
   const store = await getStore();
   const blobKey = `result/${batchId}-${index}`;
   try {
@@ -284,18 +285,40 @@ async function handleResult(batchId, index) {
       }, { status: 409 });
     }
 
-    const blob = await store.get(blobKey, { type: 'arrayBuffer' });
-    if (!blob) {
+    const metadata = await store.getMetadata(blobKey);
+    if (!metadata) {
       return Response.json({ error: 'result blob not found', batch_id: batchId, index }, { status: 404 });
     }
-    const metadata = await store.getMetadata(blobKey);
-    return new Response(blob, {
-      headers: {
-        'content-type': metadata?.content_type || 'application/octet-stream',
-        'x-batch-id': batchId,
-        'x-result-index': String(index),
-        'x-original-size': String(metadata?.size || 0),
-      },
+
+    // If passthrough=1, return raw bytes (costs bandwidth credits — 20 cr/GB)
+    if (passthrough) {
+      const blob = await store.get(blobKey, { type: 'arrayBuffer' });
+      return new Response(blob, {
+        headers: {
+          'content-type': metadata.content_type || 'application/octet-stream',
+          'x-batch-id': batchId,
+          'x-result-index': String(index),
+          'x-original-size': String(metadata.size || 0),
+        },
+      });
+    }
+
+    // Default: return metadata + blob URL (NOT the bytes — saves bandwidth)
+    // Clients use the blob_url to fetch data directly (free via Blobs API with PAT)
+    const siteId = process.env.SITE_ID || process.env.NETLIFY_SITE_ID || '';
+    const blobApiUrl = `https://api.netlify.com/api/v1/blobs/${siteId}/site:${STORE_NAME}/${blobKey}`;
+
+    return Response.json({
+      batch_id: batchId,
+      index,
+      blob_key: blobKey,
+      size: parseInt(metadata.size || '0'),
+      content_type: metadata.content_type || 'application/octet-stream',
+      stored_at: metadata.stored_at || '',
+      blob_url: blobApiUrl,
+      // Hint: fetching blob_url requires Authorization: Bearer <NETLIFY_PAT>
+      // Or use passthrough_url to proxy through function (costs bandwidth)
+      passthrough_url: `/api/result/${batchId}/${index}?passthrough=1`,
     });
   } catch (e) {
     return Response.json({ error: e.message }, { status: 500 });
@@ -342,25 +365,56 @@ async function handleList(limit = 20, statusFilter = null) {
 }
 
 async function handleTriggerBuild() {
-  // Trigger a preview deploy via the Netlify API
-  // This uses the PAT (NETLIFY_AUTH_TOKEN) stored as env var to create a deploy
+  // Trigger a preview deploy via the Netlify API — WITH actual file content
+  // so Netlify actually runs the build process (not just a CDN upload).
+  //
+  // Strategy: Write a small "trigger file" (queue manifest) into the deploy.
+  // This forces Netlify to see file changes and run the build, which executes
+  // the process-queue plugin in onPostBuild.
+  //
+  // Requires NETLIFY_AUTH_TOKEN + SITE_ID env vars on the function.
+
   const token = process.env.NETLIFY_AUTH_TOKEN;
   const siteId = process.env.SITE_ID || process.env.NETLIFY_SITE_ID;
 
   if (!token || !siteId) {
     return Response.json({
       error: 'build trigger not configured',
-      hint: 'Set NETLIFY_AUTH_TOKEN and SITE_ID env vars on the Netlify function to enable build triggering',
-      alternative: 'Run `netlify deploy` from your local machine to trigger a build',
+      hint: 'Set NETLIFY_AUTH_TOKEN and SITE_ID env vars on the function to enable build triggering',
+      alternative: 'Use `netlify deploy` CLI or Git push to trigger a build',
     }, { status: 501 });
   }
 
   try {
-    // Create a draft deploy — this creates a deploy entry
-    // Note: API deploys with empty files do NOT trigger builds on Netlify.
-    // The build only runs when using `netlify deploy` CLI or Git push.
-    // We try anyway — if the site is Git-connected, a push-based trigger works.
-    const r = await fetch(`https://api.netlify.com/api/v1/sites/${siteId}/deploys`, {
+    // Step 1: Count pending batches so we can include that in the trigger file
+    const store = await getStore();
+    const pendingList = await store.list({ prefix: 'queue/pending/' });
+    const pendingCount = pendingList.blobs?.length || 0;
+
+    if (pendingCount === 0) {
+      return Response.json({
+        ok: true,
+        message: 'No pending batches in the queue. Nothing to process.',
+        pending_count: 0,
+      });
+    }
+
+    // Step 2: Create a trigger file with unique content (forces build to see changes)
+    const triggerContent = JSON.stringify({
+      triggered_at: new Date().toISOString(),
+      pending_batches: pendingCount,
+      trigger_id: `trigger-${Date.now()}`,
+    }, null, 2);
+
+    // Compute SHA1 of the trigger file content
+    const encoder = new TextEncoder();
+    const data = encoder.encode(triggerContent);
+    const hashBuffer = await crypto.subtle.digest('SHA-1', data);
+    const sha1 = Array.from(new Uint8Array(hashBuffer))
+      .map(b => b.toString(16).padStart(2, '0')).join('');
+
+    // Step 3: Create a draft deploy with the trigger file
+    const createResp = await fetch(`https://api.netlify.com/api/v1/sites/${siteId}/deploys`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${token}`,
@@ -368,26 +422,57 @@ async function handleTriggerBuild() {
       },
       body: JSON.stringify({
         draft: true,
-        title: 'api-triggered queue processing',
+        title: `queue-trigger-${Date.now()}`,
+        files: {
+          '/queue-trigger.json': sha1,
+        },
       }),
     });
 
-    if (!r.ok) {
-      const errText = await r.text();
+    if (!createResp.ok) {
+      const errText = await createResp.text();
       return Response.json({
-        error: `Netlify API returned ${r.status}`,
+        error: `Failed to create deploy: HTTP ${createResp.status}`,
         details: errText,
-        note: 'API deploys may not trigger builds. Use `netlify deploy` CLI or Git push for reliable build triggering.',
       }, { status: 502 });
     }
 
-    const deploy = await r.json();
+    const deploy = await createResp.json();
+    const deployId = deploy.id;
+
+    // Step 4: Upload the trigger file via the presigned URL pattern
+    const uploadResp = await fetch(
+      `https://api.netlify.com/api/v1/deploys/${deployId}/files/queue-trigger.json`,
+      {
+        method: 'PUT',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/octet-stream',
+        },
+        body: triggerContent,
+      }
+    );
+
+    if (!uploadResp.ok) {
+      const errText = await uploadResp.text();
+      return Response.json({
+        error: `Failed to upload trigger file: HTTP ${uploadResp.status}`,
+        details: errText,
+        deploy_id: deployId,
+      }, { status: 502 });
+    }
+
+    console.log(`BUILD_TRIGGERED deploy_id=${deployId} pending=${pendingCount}`);
+
     return Response.json({
       ok: true,
-      message: 'Deploy triggered. Note: API deploys may not run the build process. If queue is not processed, use `netlify deploy` CLI.',
-      deploy_id: deploy.id,
+      message: `Build triggered with ${pendingCount} pending batch(es). The build process will run the queue plugin.`,
+      deploy_id: deployId,
       deploy_url: deploy.deploy_ssl_url,
-      status_url: `/api/list?status=pending`,
+      pending_count: pendingCount,
+      trigger_file: 'queue-trigger.json',
+      // Client should poll deploy status via the Netlify API, then check /api/list
+      status_url: '/api/list?status=pending',
     });
   } catch (e) {
     return Response.json({ error: e.message }, { status: 500 });

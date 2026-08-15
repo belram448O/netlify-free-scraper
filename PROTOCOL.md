@@ -220,12 +220,15 @@ The function exposes multiple routes so the full scrape → poll → retrieve fl
 |---|---|---|
 | POST | `/api/scrape` | Submit batch scrape (sync or queue mode) |
 | GET | `/api/status/{batchId}` | Check batch status |
-| GET | `/api/result/{batchId}/{index}` | Retrieve a result blob (raw bytes passthrough) |
+| GET | `/api/result/{batchId}/{index}` | Retrieve result metadata + blob URL (NOT the bytes — saves bandwidth). Use `?passthrough=1` to get raw bytes (costs credits). |
 | GET | `/api/list[?status=...&limit=20]` | List recent batches |
-| POST | `/api/trigger-build` | Trigger a preview deploy (process queue — requires `NETLIFY_AUTH_TOKEN` + `SITE_ID` env vars) |
+| POST | `/api/trigger-build` | Trigger a preview deploy WITH file content (forces build to run). Requires `NETLIFY_AUTH_TOKEN` + `SITE_ID` env vars. |
 | POST | `/api/resume` | Resume incomplete batches (crash recovery) |
+| GET | `/api/result/{batchId}/{index}?passthrough=1` | Retrieve raw blob bytes through the function (costs bandwidth — 20 cr/GB) |
 
-### Full e2e flow via HTTP only (no CLI, no PAT)
+### Full e2e flow via HTTP only (no CLI, no PAT for client)
+
+**Note:** The function needs `NETLIFY_AUTH_TOKEN` + `SITE_ID` env vars set in the Netlify dashboard for `/api/trigger-build` to work. But the CLIENT calling the API only needs `SCRAPE_API_KEY` (which can be any shared secret — not a Netlify PAT).
 
 ```bash
 # 1. Submit a batch to the queue
@@ -235,20 +238,30 @@ curl -X POST 'https://<deploy-url>/api/scrape' \
   -d '{"jobs":[{"url":"https://example.com","engine":"chrome_impersonate","tls_profile":"firefox"}],"queue":true}'
 # → { "batch_id": "batch-xxx", "status": "pending" }
 
-# 2. Trigger a build to process the queue
+# 2. Trigger a build to process the queue (function writes a trigger file to force build)
 curl -X POST 'https://<deploy-url>/api/trigger-build' \
   -H 'Authorization: Bearer <SCRAPE_API_KEY>'
-# → { "ok": true, "deploy_id": "..." }
+# → { "ok": true, "deploy_id": "...", "pending_count": 1 }
 
-# 3. Poll status
+# 3. Poll status (small JSON — no bandwidth cost)
 curl 'https://<deploy-url>/api/status/batch-xxx' \
   -H 'Authorization: Bearer <SCRAPE_API_KEY>'
 # → { "batch_id": "batch-xxx", "status": "complete", "results": [...] }
 
-# 4. Retrieve the result
+# 4. Get result metadata + blob URL (small JSON — no bandwidth cost)
 curl 'https://<deploy-url>/api/result/batch-xxx/0' \
   -H 'Authorization: Bearer <SCRAPE_API_KEY>'
+# → { "blob_url": "https://api.netlify.com/api/v1/blobs/...", "size": 559, "content_type": "text/html" }
+
+# 5. Fetch the actual data via blob URL (requires PAT — free, no bandwidth cost)
+curl 'https://api.netlify.com/api/v1/blobs/<site_id>/site:scraper-results/result/batch-xxx-0' \
+  -H 'Authorization: Bearer <NETLIFY_PAT>'
 # → raw bytes of scraped content
+
+# OR: Get bytes through the function (costs bandwidth — 20 cr/GB — use only for small results)
+curl 'https://<deploy-url>/api/result/batch-xxx/0?passthrough=1' \
+  -H 'Authorization: Bearer <SCRAPE_API_KEY>'
+# → raw bytes
 ```
 
 ### TLS profile usage
