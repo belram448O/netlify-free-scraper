@@ -2,7 +2,18 @@
 
 A production batch HTTP scraper for Netlify's free tier.
 
-## Features
+## Two endpoints, one deployment
+
+This repo deploys **two functions**, each with its own use case:
+
+| Endpoint | Function | Use when |
+|---|---|---|
+| `POST /api/scrape` | `functions/scrape.mjs` | You need batch processing, blob storage, queue mode, puppeteer, or TLS impersonation. See `PROTOCOL.md`. |
+| `POST /api/proxy` | `functions/proxy.mjs` | You just want to fetch one URL and get the bytes back. No blob, no queue, no build plugin. See `PROXY_SKILL.md`. |
+
+The proxy endpoint is the 80% case — single URL, single request, single response. If you need anything else, use the full scraper.
+
+## Features (full scraper)
 
 - **Batch processing**: Submit N URLs in one function call
 - **3 engines**: `fetch` (fast), `chrome_impersonate` (Chrome TLS), `puppeteer` (real Chrome)
@@ -11,6 +22,14 @@ A production batch HTTP scraper for Netlify's free tier.
 - **Zero queue management**: CLI reads Blobs directly — no function calls for status polling
 - **SSRF protection**: Private IP ranges blocked (IPv4 + IPv6)
 - **Optional PAT protection**: Require API key on the scrape endpoint
+
+## Features (proxy)
+
+- One endpoint, one call, one response
+- No blob storage, no queue, no build plugin, no CLI
+- 5 MB response cap, 25 second timeout
+- SSRF guard (private IPs blocked)
+- Same `SCRAPE_API_KEY` auth as the full scraper
 
 ## Quick start
 
@@ -44,7 +63,9 @@ node tools/netlify-dashboard-api.mjs disable-sso <site_id>
 
 The client NEVER needs a Netlify PAT for the function endpoints. A PAT is only needed for step 5 (fetching raw blob bytes via the Blobs API).
 
-See `PROTOCOL.md` for full API spec.
+See `PROTOCOL.md` for full API spec of the `/api/scrape` endpoint.
+See `PROXY_SKILL.md` for the lean usage doc of the `/api/proxy` endpoint.
+See `src/proxy-llms.txt` for an even leaner LLM-targeted summary of the proxy.
 
 ## Usage as a dependency
 

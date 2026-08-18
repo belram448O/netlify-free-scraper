@@ -1,0 +1,136 @@
+# Proxy API — Lean Usage Doc
+
+> Just call this endpoint. That's it. No Netlify setup, no build, no blobs.
+
+## Endpoint
+
+```
+POST https://6a803881151f1ede038cd0cc--transcendent-cheesecake-03f934.netlify.app/api/proxy
+```
+
+(Also reachable at `/.netlify/functions/proxy` on the same host.)
+
+## Auth
+
+Header: `Authorization: Bearer <SCRAPE_API_KEY>` (or `X-Api-Key: <key>`)
+
+Current key: `nfp_YfWhZCYLjYQatPEcpjDPB5WGRD8RRKaGec87`
+
+(If the key is unset on the function, the endpoint is open — but it's set.)
+
+## Request
+
+```json
+{
+  "url": "https://httpbin.org/get",
+  "method": "GET",
+  "headers": { "X-Custom": "value" },
+  "body": null,
+  "timeout_ms": 25000,
+  "follow_redirects": true,
+  "user_agent": "Mozilla/5.0 ..."
+}
+```
+
+Only `url` is required. Everything else is optional.
+
+| Field | Default | Notes |
+|---|---|---|
+| `url` | (required) | http(s) only |
+| `method` | `GET` | One of GET, HEAD, POST, PUT, PATCH, DELETE |
+| `headers` | `{}` | Object of header name → value |
+| `body` | `null` | String for raw body, object for JSON (auto-sets Content-Type) |
+| `timeout_ms` | `25000` | Clamped to 1000–25000 |
+| `follow_redirects` | `true` | Set `false` to get the redirect response itself |
+| `user_agent` | Chrome 120 UA string | Override the User-Agent header |
+
+## Response
+
+The response body is the upstream response bytes, returned inline.
+
+```
+HTTP/1.1 200 OK
+Content-Type: <upstream content-type>
+X-Proxy-Status: <upstream status code>
+X-Proxy-Elapsed-Ms: <elapsed milliseconds>
+X-Proxy-Final-Url: <final URL after redirects>
+X-Proxy-Bytes: <byte count>
+X-Proxy-Redirected: 1   (only if a redirect occurred)
+```
+
+The HTTP status of the proxy response is always `200` if the upstream fetch succeeded (even if upstream returned 4xx/5xx). The original status is in `X-Proxy-Status`. This is so you can read the body for any response code without surprises.
+
+## Errors
+
+The proxy returns these status codes:
+
+| Proxy status | Meaning | Body |
+|---|---|---|
+| `200` | Upstream fetched successfully (upstream may still be 4xx/5xx — check `X-Proxy-Status`) | upstream bytes |
+| `400` | Bad request (missing URL, bad JSON, etc.) | `{"error": "...", "hint": "..."}` |
+| `401` | Auth required / wrong key | `{"error": "unauthorized"}` |
+| `403` | URL blocked (private IP / loopback) | `{"error": "blocked: ..."}` |
+| `405` | Method not allowed (only POST) | `{"error": "method not allowed"}` |
+| `502` | Upstream fetch failed (DNS, connection refused, etc.) | `{"error": "upstream fetch failed", "hint": "..."}` |
+| `504` | Upstream timeout | `{"error": "upstream timeout"}` |
+
+## Limits
+
+- **5 MB response cap** (hard). Larger responses are truncated and the request fails with `502`.
+- **25 second timeout** (hard).
+- **No retries.** If the upstream fails, the proxy fails.
+- **No persistence.** Don't expect the body to be saved anywhere.
+- **SSRF guard.** Localhost, private IPs (10/8, 172.16/12, 192.168/16, 169.254/16 link-local, ::1) are blocked.
+- **No streaming.** The full body is buffered before returning.
+
+## Examples
+
+### Simple GET
+
+```bash
+curl -X POST 'https://6a803881151f1ede038cd0cc--transcendent-cheesecake-03f934.netlify.app/api/proxy' \
+  -H 'Authorization: Bearer nfp_YfWhZCYLjYQatPEcpjDPB5WGRD8RRKaGec87' \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://httpbin.org/get"}'
+```
+
+### With custom headers
+
+```bash
+curl -X POST 'https://6a803881151f1ede038cd0cc--transcendent-cheesecake-03f934.netlify.app/api/proxy' \
+  -H 'Authorization: Bearer nfp_YfWhZCYLjYQatPEcpjDPB5WGRD8RRKaGec87' \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://api.github.com/repos/microsoft/vscode","headers":{"Accept":"application/vnd.github+json"}}'
+```
+
+### POST with JSON body
+
+```bash
+curl -X POST 'https://6a803881151f1ede038cd0cc--transcendent-cheesecake-03f934.netlify.app/api/proxy' \
+  -H 'Authorization: Bearer nfp_YfWhZCYLjYQatPEcpjDPB5WGRD8RRKaGec87' \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://httpbin.org/post","method":"POST","body":{"hello":"world"}}'
+```
+
+### Disable redirects
+
+```bash
+curl -X POST 'https://6a803881151f1ede038cd0cc--transcendent-cheesecake-03f934.netlify.app/api/proxy' \
+  -H 'Authorization: Bearer nfp_YfWhZCYLjYQatPEcpjDPB5WGRD8RRKaGec87' \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/redirecting","follow_redirects":false}'
+```
+
+## When to use this vs the full scraper
+
+| Need | Use |
+|---|---|
+| Fetch one URL, get bytes back, move on | **This endpoint (`/api/proxy`)** |
+| Batch fetch many URLs in one call | `/api/scrape` (full scraper) |
+| Persist results to blob storage for later retrieval | `/api/scrape` (full scraper) |
+| Use puppeteer for JS-rendered pages | `/api/scrape` with `engine: puppeteer` (build plugin) |
+| TLS fingerprint impersonation | `/api/scrape` with `engine: chrome_impersonate` |
+| Long-running jobs (>25s) | `/api/scrape` with `queue: true` (build plugin) |
+| Anything that doesn't fit the above | `/api/scrape` (see PROTOCOL.md) |
+
+This endpoint is the 80% case — single URL, single request, single response. If you need anything else, use the full scraper.
